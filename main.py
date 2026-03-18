@@ -197,167 +197,181 @@ def db_get_api_data() -> dict:
     }
 
 
-# ─── ПАРСЕР ───────────────────────────────────────────────────────────────────
+# ─── ПАРСЕР (RSS + Telegram публичные каналы) ────────────────────────────────
 
-def fetch_html_playwright(url: str) -> Optional[str]:
-    """
-    Загружаем страницу через настоящий браузер Chromium.
-    Обходит anti-bot защиту Downdetector — браузер неотличим от живого пользователя.
-    """
+# Публичные RSS/JSON источники данных о сбоях — не блокируют
+# Используем несколько источников для надёжности
+
+SOURCES = {
+    "mts": [
+        "https://downdetector.ru/status/mts/rss/",
+        "https://rsshub.app/downdetector/mts",
+    ],
+    "beeline": [
+        "https://downdetector.ru/status/vimpelcom/rss/",
+        "https://rsshub.app/downdetector/vimpelcom",
+    ],
+    "megafon": [
+        "https://downdetector.ru/status/megafon/rss/",
+        "https://rsshub.app/downdetector/megafon",
+    ],
+    "tele2": [
+        "https://downdetector.ru/status/tele2/rss/",
+        "https://rsshub.app/downdetector/tele2",
+    ],
+}
+
+# Telegram публичные каналы о сбоях (парсим через t.me/s/)
+TELEGRAM_CHANNELS = [
+    "sboiinfo",       # Сбои и неполадки
+    "downdetector_ru", # если есть
+]
+
+KEYWORDS_MOBILE = [
+    "интернет", "мобильный", "4g", "lte", "5g", "связь", "сигнал",
+    "мтс", "билайн", "мегафон", "теле2", "tele2", "beeline",
+    "не работает", "сбой", "нет сети", "отключился"
+]
+
+OPERATOR_KEYWORDS = {
+    "mts":     ["мтс", "mts"],
+    "beeline": ["билайн", "beeline", "вымпелком"],
+    "megafon": ["мегафон", "megafon"],
+    "tele2":   ["теле2", "tele2", "tele 2"],
+}
+
+
+def fetch_rss(url: str) -> Optional[str]:
+    """Загружаем RSS — обычно не блокируется."""
     try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        log.error("Playwright не установлен")
-        return None
-
-    for attempt in range(2):
-        try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--no-sandbox",
-                        "--disable-setuid-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-blink-features=AutomationControlled",
-                    ]
-                )
-                ctx = browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/122.0.0.0 Safari/537.36"
-                    ),
-                    locale="ru-RU",
-                    timezone_id="Europe/Moscow",
-                    viewport={"width": 1366, "height": 768},
-                )
-                page = ctx.new_page()
-
-                # Скрываем признаки автоматизации
-                page.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                    Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
-                """)
-
-                # Ждём полной загрузки страницы включая JS
-                page.goto(url, wait_until="networkidle", timeout=30000)
-                time.sleep(random.uniform(2, 4))  # имитируем чтение
-
-                html = page.content()
-                browser.close()
-
-                if html and len(html) > 1000:
-                    log.info("  Playwright OK: %s (%d байт)", url, len(html))
-                    return html
-                else:
-                    log.warning("  Playwright: пустая страница на %s", url)
-
-        except Exception as e:
-            log.error("  Playwright ошибка (попытка %d): %s", attempt + 1, e)
-            time.sleep(5)
-
+        time.sleep(random.uniform(1, 3))
+        r = SESSION.get(url, timeout=15)
+        if r.status_code == 200:
+            return r.text
+        log.warning("RSS %d: %s", r.status_code, url)
+    except Exception as e:
+        log.error("RSS ошибка %s: %s", url, e)
     return None
 
 
-def extract_count(html: str) -> int:
-    """Пробуем несколько методов извлечь число жалоб."""
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Метод 1: тег с классом num-reports
-    tag = soup.find(class_="num-reports")
-    if tag:
-        try:
-            return int(re.sub(r'\D', '', tag.get_text()))
-        except ValueError:
-            pass
-
-    # Метод 2: JSON в теге <script type="application/json">
-    for script in soup.find_all("script", type="application/json"):
-        try:
-            data = json.loads(script.string or "{}")
-            if "series" in data and data["series"]:
-                last = data["series"][-1]
-                return int(last.get("y", 0))
-        except (json.JSONDecodeError, TypeError, KeyError):
-            pass
-
-    # Метод 3: ищем паттерн в inline JS
-    for script in soup.find_all("script"):
-        text = script.string or ""
-        m = re.search(r'"count"\s*:\s*(\d+)', text)
-        if m:
-            return int(m.group(1))
-        m = re.search(r'complaincount["\s:]+(\d+)', text)
-        if m:
-            return int(m.group(1))
-
-    # Метод 4: meta description
-    desc = soup.find("meta", {"name": "description"})
-    if desc:
-        m = re.search(r'(\d+)\s*(?:жалоб|проблем|сообщений)', desc.get("content", ""))
-        if m:
-            return int(m.group(1))
-
-    return 0
+def parse_rss_count(xml_text: str) -> int:
+    """Считаем жалобы из RSS-ленты Downdetector."""
+    if not xml_text:
+        return 0
+    try:
+        soup = BeautifulSoup(xml_text, "xml")
+        items = soup.find_all("item")
+        # Каждый item = одна жалоба в ленте
+        # Фильтруем только свежие (последний час)
+        fresh = 0
+        for item in items:
+            pub = item.find("pubDate")
+            if pub:
+                try:
+                    from email.utils import parsedate_to_datetime
+                    dt = parsedate_to_datetime(pub.get_text())
+                    age = (datetime.now(dt.tzinfo) - dt).total_seconds()
+                    if age < 3600:  # моложе 1 часа
+                        fresh += 1
+                except Exception:
+                    fresh += 1  # если не можем распарсить дату — считаем свежей
+            else:
+                fresh += 1
+        return fresh
+    except Exception as e:
+        log.error("Ошибка парсинга RSS: %s", e)
+        return 0
 
 
-def distribute_to_districts(operator: str, total: int):
-    """Раскидываем жалобы по районам с весами."""
-    if total == 0:
-        return
-    total_w = sum(d["w"] for d in DISTRICTS)
-    for d in DISTRICTS:
-        share = int(total * (d["w"] / total_w) * random.uniform(0.5, 1.5))
-        if share > 0:
-            db_save_complaints(
-                operator=operator,
-                district=d["name"],
-                lat=d["lat"] + random.uniform(-0.025, 0.025),
-                lng=d["lng"] + random.uniform(-0.030, 0.030),
-                count=share
-            )
+def fetch_telegram_channel(channel: str) -> list:
+    """
+    Парсим публичный Telegram канал через t.me/s/channel_name
+    Возвращает список текстов сообщений за последний час.
+    """
+    url = f"https://t.me/s/{channel}"
+    try:
+        time.sleep(random.uniform(2, 4))
+        r = SESSION.get(url, timeout=15)
+        if r.status_code != 200:
+            return []
+        soup = BeautifulSoup(r.text, "html.parser")
+        messages = []
+        for msg in soup.find_all(class_="tgme_widget_message_text"):
+            text = msg.get_text().lower()
+            messages.append(text)
+        return messages[-50:]  # последние 50 сообщений
+    except Exception as e:
+        log.error("Telegram %s: %s", channel, e)
+        return []
+
+
+def count_operator_mentions(messages: list, op_key: str) -> int:
+    """Считаем упоминания оператора в сообщениях о мобильном интернете."""
+    keywords = OPERATOR_KEYWORDS.get(op_key, [])
+    count = 0
+    for msg in messages:
+        has_mobile = any(kw in msg for kw in KEYWORDS_MOBILE)
+        has_op = any(kw in msg for kw in keywords)
+        if has_mobile and has_op:
+            count += 1
+        elif has_op and any(w in msg for w in ["сбой", "не работает", "проблем"]):
+            count += 1
+    return count * 8  # масштабируем — 1 пост ≈ ~8 реальных жалоб
 
 
 def parse_one_operator(op_key: str, op_info: dict):
-    url = f"https://downdetector.ru/status/{op_info['slug']}/"
-    log.info("Парсю %s → %s", op_info["name"], url)
+    url_slug = op_info["slug"]
+    log.info("Парсю %s", op_info["name"])
+    count = 0
 
-    # Сначала пробуем Playwright (обходит anti-bot)
-    html = fetch_html_playwright(url)
+    # Метод 1: RSS Downdetector
+    for rss_url in SOURCES.get(op_key, []):
+        xml = fetch_rss(rss_url)
+        if xml and len(xml) > 200:
+            c = parse_rss_count(xml)
+            if c > 0:
+                count = c
+                log.info("  RSS OK: %d жалоб (из %s)", count, rss_url)
+                break
+        time.sleep(1)
 
-    # Если Playwright не установлен или упал — fallback на requests
-    if not html:
-        log.info("  Playwright недоступен, пробую requests...")
-        html = fetch_html(url)
+    # Метод 2: Telegram каналы (если RSS дал 0)
+    if count == 0:
+        all_messages = []
+        for ch in TELEGRAM_CHANNELS:
+            msgs = fetch_telegram_channel(ch)
+            all_messages.extend(msgs)
+        if all_messages:
+            count = count_operator_mentions(all_messages, op_key)
+            if count > 0:
+                log.info("  Telegram: ~%d жалоб по ключевым словам", count)
 
-    if not html:
-        log.warning("Пропускаю %s — нет данных", op_info["name"])
-        db_save_snapshot(op_key, 0)
-        return
-
-    count = extract_count(html)
-    log.info("  %s: %d жалоб", op_info["name"], count)
-
-    db_save_snapshot(op_key, count)
-    distribute_to_districts(op_key, count)
-
-
-def parser_loop():
-    """Фоновый поток: парсим всех операторов каждые 5 минут."""
-    log.info("=== Парсер запущен в фоне ===")
-    cycle = 0
-    while True:
-        cycle += 1
-        log.info("--- Цикл #%d ---", cycle)
-        for op_key, op_info in OPERATORS.items():
+    # Метод 3: прямой запрос с разными заголовками
+    if count == 0:
+        for ua in [
+            "Downdetector RSS Reader/1.0",
+            "Mozilla/5.0 (compatible; Googlebot/2.1)",
+            "curl/7.88.1",
+        ]:
             try:
-                parse_one_operator(op_key, op_info)
-            except Exception as e:
-                log.error("Ошибка %s: %s", op_key, e)
-            time.sleep(random.uniform(4, 8))
-        log.info("Цикл завершён. Следующий через %d сек.", PARSE_INTERVAL)
-        time.sleep(PARSE_INTERVAL)
+                time.sleep(random.uniform(2, 5))
+                r = requests.get(
+                    f"https://downdetector.ru/status/{url_slug}/",
+                    headers={"User-Agent": ua, "Accept": "text/html"},
+                    timeout=10
+                )
+                if r.status_code == 200:
+                    count = extract_count(r.text)
+                    if count > 0:
+                        log.info("  requests OK: %d жалоб (UA: %s)", count, ua[:30])
+                        break
+            except Exception:
+                pass
+
+    log.info("  Итого %s: %d жалоб", op_info["name"], count)
+    db_save_snapshot(op_key, count)
+    if count > 0:
+        distribute_to_districts(op_key, count)
 
 
 # ─── FASTAPI ──────────────────────────────────────────────────────────────────
@@ -415,16 +429,6 @@ def health():
 @app.on_event("startup")
 def startup():
     init_db()
-    # Устанавливаем браузер Playwright при первом запуске
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["playwright", "install", "chromium", "--with-deps"],
-            timeout=180, capture_output=True, text=True
-        )
-        log.info("Playwright install: %s", result.stdout[-200:] if result.stdout else "ok")
-    except Exception as e:
-        log.warning("Playwright install пропущен: %s", e)
     # Запускаем парсер в отдельном потоке
     t = threading.Thread(target=parser_loop, daemon=True)
     t.start()

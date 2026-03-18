@@ -16,6 +16,7 @@ from typing import Optional
 
 import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -198,37 +199,64 @@ def db_get_api_data() -> dict:
 
 # ─── ПАРСЕР ───────────────────────────────────────────────────────────────────
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
-    "Referer": "https://downdetector.ru/",
-}
+def fetch_html_playwright(url: str) -> Optional[str]:
+    """
+    Загружаем страницу через настоящий браузер Chromium.
+    Обходит anti-bot защиту Downdetector — браузер неотличим от живого пользователя.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        log.error("Playwright не установлен")
+        return None
 
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
-
-
-def fetch_html(url: str) -> Optional[str]:
-    for attempt in range(3):
+    for attempt in range(2):
         try:
-            time.sleep(random.uniform(3, 6))
-            r = SESSION.get(url, timeout=20)
-            if r.status_code == 200:
-                log.info("  OK %s", url)
-                return r.text
-            elif r.status_code == 403:
-                log.warning("  403 на %s (anti-bot блокировка)", url)
-                return None
-            else:
-                log.warning("  HTTP %d на %s", r.status_code, url)
-        except requests.RequestException as e:
-            log.error("  Ошибка запроса попытка %d: %s", attempt + 1, e)
-            time.sleep(8)
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-blink-features=AutomationControlled",
+                    ]
+                )
+                ctx = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/122.0.0.0 Safari/537.36"
+                    ),
+                    locale="ru-RU",
+                    timezone_id="Europe/Moscow",
+                    viewport={"width": 1366, "height": 768},
+                )
+                page = ctx.new_page()
+
+                # Скрываем признаки автоматизации
+                page.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
+                """)
+
+                # Ждём полной загрузки страницы включая JS
+                page.goto(url, wait_until="networkidle", timeout=30000)
+                time.sleep(random.uniform(2, 4))  # имитируем чтение
+
+                html = page.content()
+                browser.close()
+
+                if html and len(html) > 1000:
+                    log.info("  Playwright OK: %s (%d байт)", url, len(html))
+                    return html
+                else:
+                    log.warning("  Playwright: пустая страница на %s", url)
+
+        except Exception as e:
+            log.error("  Playwright ошибка (попытка %d): %s", attempt + 1, e)
+            time.sleep(5)
+
     return None
 
 
@@ -264,7 +292,7 @@ def extract_count(html: str) -> int:
         if m:
             return int(m.group(1))
 
-    # Метод 4: meta-тег description часто содержит число
+    # Метод 4: meta description
     desc = soup.find("meta", {"name": "description"})
     if desc:
         m = re.search(r'(\d+)\s*(?:жалоб|проблем|сообщений)', desc.get("content", ""))
@@ -295,9 +323,15 @@ def parse_one_operator(op_key: str, op_info: dict):
     url = f"https://downdetector.ru/status/{op_info['slug']}/"
     log.info("Парсю %s → %s", op_info["name"], url)
 
-    html = fetch_html(url)
+    # Сначала пробуем Playwright (обходит anti-bot)
+    html = fetch_html_playwright(url)
+
+    # Если Playwright не установлен или упал — fallback на requests
     if not html:
-        # Если заблокировало — сохраняем 0, не крашим
+        log.info("  Playwright недоступен, пробую requests...")
+        html = fetch_html(url)
+
+    if not html:
         log.warning("Пропускаю %s — нет данных", op_info["name"])
         db_save_snapshot(op_key, 0)
         return
@@ -381,6 +415,16 @@ def health():
 @app.on_event("startup")
 def startup():
     init_db()
+    # Устанавливаем браузер Playwright при первом запуске
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["playwright", "install", "chromium", "--with-deps"],
+            timeout=180, capture_output=True, text=True
+        )
+        log.info("Playwright install: %s", result.stdout[-200:] if result.stdout else "ok")
+    except Exception as e:
+        log.warning("Playwright install пропущен: %s", e)
     # Запускаем парсер в отдельном потоке
     t = threading.Thread(target=parser_loop, daemon=True)
     t.start()
